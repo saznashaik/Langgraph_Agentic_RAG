@@ -11,7 +11,6 @@ from langgraph_backend import (
 )
 
 
-
 # =========================== Utilities ===========================
 def generate_thread_id():
     return uuid.uuid4()
@@ -34,52 +33,52 @@ def load_conversation(thread_id):
     return state.values.get("messages", [])
 
 
-
-def load_chat(thread_id):
-    """Load a selected chat."""
-    st.session_state["thread_id"] = thread_id
-
-    messages = load_conversation(thread_id)
-
+def convert_messages(messages):
+    """
+    Convert LangChain messages to display-safe dicts.
+    - Keep HumanMessages as "user"
+    - Keep AIMessages that have real text content (skip tool-call-only messages)
+    - Skip ToolMessages entirely (raw JSON tool output)
+    """
     temp_messages = []
 
     for msg in messages:
+        if isinstance(msg, HumanMessage):
+            if msg.content:
+                temp_messages.append({"role": "user", "content": msg.content})
 
-        role = (
-            "user"
-            if isinstance(msg, HumanMessage)
-            else "assistant"
-        )
+        elif isinstance(msg, AIMessage):
+            # Skip messages that are purely tool calls (no visible text)
+            if getattr(msg, "tool_calls", None) and not msg.content:
+                continue
+            if msg.content:
+                temp_messages.append({"role": "assistant", "content": msg.content})
 
-        temp_messages.append(
-            {
-                "role": role,
-                "content": msg.content
-            }
-        )
+        elif isinstance(msg, ToolMessage):
+            # Never show raw tool output in the chat
+            continue
 
-    st.session_state["message_history"] = temp_messages
+    return temp_messages
+
+
+def load_chat(thread_id):
+    """Load a selected chat, showing only clean user/assistant messages."""
+    st.session_state["thread_id"] = thread_id
+    messages = load_conversation(thread_id)
+    st.session_state["message_history"] = convert_messages(messages)
 
 
 def get_chat_title(thread_id):
-    """
-    Use the first user message as the title,
-    similar to ChatGPT.
-    """
-
+    """Use the first user message as the title, similar to ChatGPT."""
     messages = load_conversation(thread_id)
-
     for msg in messages:
         if isinstance(msg, HumanMessage):
-
             title = msg.content.strip()
-
             if len(title) > 40:
                 title = title[:40] + "..."
-
             return title
-
     return "New Chat"
+
 
 # ======================= Session Initialization ===================
 if "message_history" not in st.session_state:
@@ -98,8 +97,6 @@ add_thread(st.session_state["thread_id"])
 
 thread_key = str(st.session_state["thread_id"])
 thread_docs = st.session_state["ingested_docs"].setdefault(thread_key, {})
-threads = st.session_state["chat_threads"][::-1]
-selected_thread = None
 
 # ============================ Sidebar ============================
 st.sidebar.title("🤖 Agentic AI")
@@ -111,74 +108,58 @@ if st.sidebar.button("New Chat", use_container_width=True):
     st.rerun()
 
 st.sidebar.subheader("Past conversations")
-if not threads:
+if not st.session_state["chat_threads"]:
     st.sidebar.write("No past conversations yet.")
 else:
-    # newest chats first
-    for thread_id in st.session_state['chat_threads'][::-1]:
-
+    for thread_id in st.session_state["chat_threads"][::-1]:
         title = get_chat_title(thread_id)
-
-        if st.sidebar.button(
-            title,
-            key=f"thread_{thread_id}",
-            use_container_width=True
-        ):
+        if st.sidebar.button(title, key=f"thread_{thread_id}", use_container_width=True):
             load_chat(thread_id)
             st.rerun()
 
 
 # ============================ Main Layout ========================
 if not st.session_state["message_history"]:
-
     st.markdown("""
     <div class="chat-title">
         <h1>🤖 Agentic AI Assistant</h1>
         <p>Upload PDFs, ask questions, and use tools</p>
     </div>
     """, unsafe_allow_html=True)
-
 else:
     st.title("🤖 Agentic AI Assistant")
 
-# Chat area
+# Chat area — only clean user/assistant messages are in message_history
 for message in st.session_state["message_history"]:
     with st.chat_message(message["role"]):
         st.markdown(message["content"])
 
-prompt = st.chat_input(
-    "Ask about your document...",
-    accept_file=True
-)
+prompt = st.chat_input("Ask about your document...", accept_file=True)
 
 if prompt:
     user_input = prompt.text
-
     uploaded_files = prompt.files
 
     if uploaded_files:
-
         for uploaded_pdf in uploaded_files:
-
             if uploaded_pdf.name in thread_docs:
                 st.info(f"📄 {uploaded_pdf.name} already indexed.")
                 continue
 
             with st.status(f"Indexing {uploaded_pdf.name}...", expanded=True):
-
                 summary = ingest_pdf(
                     uploaded_pdf.getvalue(),
                     thread_id=thread_key,
                     filename=uploaded_pdf.name,
                 )
-
                 thread_docs[uploaded_pdf.name] = summary
                 st.session_state["active_document"] = uploaded_pdf.name
                 st.success(f"✅ {uploaded_pdf.name} indexed")
 
+    # Show user message immediately
     st.session_state["message_history"].append({"role": "user", "content": user_input})
     with st.chat_message("user"):
-        st.text(user_input)
+        st.markdown(user_input)
 
     CONFIG = {
         "configurable": {"thread_id": thread_key},
@@ -188,29 +169,20 @@ if prompt:
 
     # Build document-aware prompt
     message_content = user_input
-
     if "active_document" in st.session_state:
-
         active_doc = st.session_state["active_document"]
-
         message_content = f"""
-    Current uploaded PDF: {active_doc}
+Current uploaded PDF: {active_doc}
 
-    The user may refer to this document using phrases like:
-    - this pdf
-    - this document
-    - summarize this
-    - summarize this one
-    - explain this
-    - explain the document
-    - what is in this file
+The user may refer to this document using phrases like:
+- this pdf, this document, summarize this, explain this, what is in this file
 
-    Assume the user is referring to the uploaded PDF unless they explicitly mention another document.
+Assume the user is referring to the uploaded PDF unless they explicitly mention another document.
 
-    User request:
-    {user_input}
-    """
-        
+User request:
+{user_input}
+"""
+
     with st.chat_message("assistant"):
         status_holder = {"box": None}
 
@@ -220,6 +192,7 @@ if prompt:
                 config=CONFIG,
                 stream_mode="messages",
             ):
+                # Show a status indicator for tool use, but don't yield tool output
                 if isinstance(message_chunk, ToolMessage):
                     tool_name = getattr(message_chunk, "name", "tool")
                     if status_holder["box"] is None:
@@ -233,8 +206,12 @@ if prompt:
                             expanded=True,
                         )
 
+                # Only yield actual AI text — skip tool-call-only chunks
                 if isinstance(message_chunk, AIMessage):
-                    yield message_chunk.content
+                    if getattr(message_chunk, "tool_calls", None) and not message_chunk.content:
+                        continue
+                    if message_chunk.content:
+                        yield message_chunk.content
 
         ai_message = st.write_stream(ai_only_stream())
 
@@ -255,15 +232,3 @@ if prompt:
         )
 
 st.divider()
-
-if selected_thread:
-    st.session_state["thread_id"] = selected_thread
-    messages = load_conversation(selected_thread)
-
-    temp_messages = []
-    for msg in messages:
-        role = "user" if isinstance(msg, HumanMessage) else "assistant"
-        temp_messages.append({"role": role, "content": msg.content})
-    st.session_state["message_history"] = temp_messages
-    st.session_state["ingested_docs"].setdefault(str(selected_thread), {})
-    st.rerun()
